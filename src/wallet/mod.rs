@@ -7,7 +7,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use bitcoin::blockdata::opcodes;
 use bitcoin::blockdata::script::Builder;
 use bitcoin::consensus::encode::serialize;
-use bitcoin::util::bip32::{ChildNumber, DerivationPath};
 use bitcoin::util::psbt::PartiallySignedTransaction as PSBT;
 use bitcoin::{
     Address, Network, OutPoint, PublicKey, Script, SigHashType, Transaction, TxIn, TxOut, Txid,
@@ -247,22 +246,15 @@ where
         let mut psbt = PSBT::from_unsigned_tx(tx)?;
 
         // add metadata for the inputs
-        for ((psbt_input, (script_type, path)), input) in psbt
+        for ((psbt_input, (script_type, child)), input) in psbt
             .inputs
             .iter_mut()
             .zip(paths.into_iter())
             .zip(psbt.global.unsigned_tx.input.iter())
         {
-            let path: Vec<ChildNumber> = path.into();
-            let index = match path.last() {
-                Some(ChildNumber::Normal { index }) => *index,
-                Some(ChildNumber::Hardened { index }) => *index,
-                None => 0,
-            };
-
             let desc = self.get_descriptor_for(script_type);
-            psbt_input.hd_keypaths = desc.get_hd_keypaths(index).unwrap();
-            let derived_descriptor = desc.derive(index).unwrap();
+            psbt_input.hd_keypaths = desc.get_hd_keypaths(child).unwrap();
+            let derived_descriptor = desc.derive(child).unwrap();
 
             // TODO: figure out what do redeem_script and witness_script mean
             psbt_input.redeem_script = derived_descriptor.psbt_redeem_script();
@@ -285,9 +277,20 @@ where
             psbt_input.sighash_type = Some(SigHashType::All);
         }
 
-        // TODO: add metadata for the outputs, like derivation paths for change addrs
-        /*for psbt_output in psbt.outputs.iter_mut().zip(psbt.global.unsigned_tx.output.iter()) {
-        }*/
+        for (psbt_output, tx_output) in psbt
+            .outputs
+            .iter_mut()
+            .zip(psbt.global.unsigned_tx.output.iter())
+        {
+            if let Some((script_type, child)) = self
+                .database
+                .borrow()
+                .get_path_from_script_pubkey(&tx_output.script_pubkey)?
+            {
+                let desc = self.get_descriptor_for(script_type);
+                psbt_output.hd_keypaths = desc.get_hd_keypaths(child)?;
+            }
+        }
 
         let transaction_details = TransactionDetails {
             transaction: None,
@@ -299,47 +302,6 @@ where
         };
 
         Ok((psbt, transaction_details))
-    }
-
-    // TODO: move down to the "internals"
-    fn add_hd_keypaths(&self, psbt: &mut PSBT) -> Result<(), Error> {
-        let mut input_utxos = Vec::with_capacity(psbt.inputs.len());
-        for n in 0..psbt.inputs.len() {
-            input_utxos.push(psbt.get_utxo_for(n).clone());
-        }
-
-        // try to add hd_keypaths if we've already seen the output
-        for (psbt_input, out) in psbt.inputs.iter_mut().zip(input_utxos.iter()) {
-            debug!("searching hd_keypaths for out: {:?}", out);
-
-            if let Some(out) = out {
-                let option_path = self
-                    .database
-                    .borrow()
-                    .get_path_from_script_pubkey(&out.script_pubkey)?;
-
-                debug!("found descriptor path {:?}", option_path);
-
-                let (script_type, path) = match option_path {
-                    None => continue,
-                    Some((script_type, path)) => (script_type, path),
-                };
-
-                // TODO: this is duplicated code
-                let index = match path.into_iter().last() {
-                    Some(ChildNumber::Normal { index }) => *index,
-                    Some(ChildNumber::Hardened { index }) => *index,
-                    None => 0,
-                };
-
-                // merge hd_keypaths
-                let desc = self.get_descriptor_for(script_type);
-                let mut hd_keypaths = desc.get_hd_keypaths(index)?;
-                psbt_input.hd_keypaths.append(&mut hd_keypaths);
-            }
-        }
-
-        Ok(())
     }
 
     // TODO: define an enum for signing errors
@@ -661,9 +623,9 @@ where
         outgoing: u64,
         input_witness_weight: usize,
         mut fee_val: f32,
-    ) -> Result<(Vec<TxIn>, Vec<(ScriptType, DerivationPath)>, u64, f32), Error> {
+    ) -> Result<(Vec<TxIn>, Vec<(ScriptType, u32)>, u64, f32), Error> {
         let mut answer = Vec::new();
-        let mut paths = Vec::new();
+        let mut deriv_indexes = Vec::new();
         let calc_fee_bytes = |wu| (wu as f32) * fee_rate / 4.0;
 
         debug!(
@@ -697,15 +659,48 @@ where
             answer.push(new_in);
             selected_amount += utxo.txout.value;
 
-            let path = self
+            let child = self
                 .database
                 .borrow()
                 .get_path_from_script_pubkey(&utxo.txout.script_pubkey)?
                 .unwrap(); // TODO: remove unrwap
-            paths.push(path);
+            deriv_indexes.push(child);
         }
 
-        Ok((answer, paths, selected_amount, fee_val))
+        Ok((answer, deriv_indexes, selected_amount, fee_val))
+    }
+
+    fn add_hd_keypaths(&self, psbt: &mut PSBT) -> Result<(), Error> {
+        let mut input_utxos = Vec::with_capacity(psbt.inputs.len());
+        for n in 0..psbt.inputs.len() {
+            input_utxos.push(psbt.get_utxo_for(n).clone());
+        }
+
+        // try to add hd_keypaths if we've already seen the output
+        for (psbt_input, out) in psbt.inputs.iter_mut().zip(input_utxos.iter()) {
+            debug!("searching hd_keypaths for out: {:?}", out);
+
+            if let Some(out) = out {
+                let option_path = self
+                    .database
+                    .borrow()
+                    .get_path_from_script_pubkey(&out.script_pubkey)?;
+
+                debug!("found descriptor path {:?}", option_path);
+
+                let (script_type, child) = match option_path {
+                    None => continue,
+                    Some((script_type, child)) => (script_type, child),
+                };
+
+                // merge hd_keypaths
+                let desc = self.get_descriptor_for(script_type);
+                let mut hd_keypaths = desc.get_hd_keypaths(child)?;
+                psbt_input.hd_keypaths.append(&mut hd_keypaths);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -775,11 +770,10 @@ where
         // TODO:
         // let batch_query_size = batch_query_size.unwrap_or(20);
 
-        let path = DerivationPath::from(vec![ChildNumber::Normal { index: max_address }]);
         let last_addr = self
             .database
             .borrow()
-            .get_script_pubkey_from_path(ScriptType::External, &path)?;
+            .get_script_pubkey_from_path(ScriptType::External, max_address)?;
 
         // cache a few of our addresses
         if last_addr.is_none() {
@@ -789,23 +783,21 @@ where
 
             for i in 0..=max_address {
                 let derived = self.descriptor.derive(i).unwrap();
-                let full_path = DerivationPath::from(vec![ChildNumber::Normal { index: i }]);
 
                 address_batch.set_script_pubkey(
                     &derived.script_pubkey(),
                     ScriptType::External,
-                    &full_path,
+                    i,
                 )?;
             }
             if self.change_descriptor.is_some() {
                 for i in 0..=max_address {
                     let derived = self.change_descriptor.as_ref().unwrap().derive(i).unwrap();
-                    let full_path = DerivationPath::from(vec![ChildNumber::Normal { index: i }]);
 
                     address_batch.set_script_pubkey(
                         &derived.script_pubkey(),
                         ScriptType::Internal,
-                        &full_path,
+                        i,
                     )?;
                 }
             }
